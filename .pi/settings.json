@@ -1,0 +1,9 @@
+{
+  "subagents": {
+    "agentOverrides": {
+      "oracle": {
+        "model": "anthropic/claude-opus-latest"
+      }
+    }
+  }
+}
