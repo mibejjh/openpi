@@ -125,6 +125,27 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
+                if model_config.cotrain_subtask_data:
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.TokenizeSubtask(tokenizer=_tokenizer.PaligemmaTokenizer(model_config.max_token_len)),
+                            _transforms.ResizeImages(height=224, width=224),
+                            _transforms.RepackTransform(
+                                {
+                                    "images": {"base_0_rgb": "image_0"},
+                                    "image_masks": {"base_0_rgb": "image_0_mask"},
+                                    "state": "state",
+                                    "tokenized_prompt": "tokenized_prompt",
+                                    "tokenized_prompt_mask": "tokenized_prompt_mask",
+                                    "token_ar_mask": "token_ar_mask",
+                                    "token_loss_mask": "token_loss_mask",
+                                    "actions": "actions",
+                                }
+                            ),
+                        ],
+                        outputs=[_transforms.RepackTransform({"action": "actions"})],
+                    )
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -593,11 +614,21 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="trossen"),
             default_prompt="open the tupperware and put the food on the plate",
         ),
+    ),
+    TrainConfig(
+        name="pi05_subtask_aloha",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            cotrain_subtask_data=True,
+            ce_loss_weight=1.0,
+        ),
+        data=LeRobotAlohaDataConfig(
+            assets=AssetsConfig(asset_id="trossen"),
+        ),
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     #
     # Inference DROID configs.
-    #
     TrainConfig(
         name="pi0_droid",
         model=pi0_config.Pi0Config(action_horizon=10),
