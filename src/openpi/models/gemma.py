@@ -396,19 +396,20 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
-        embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
+        return_prelogits: bool = False,
+    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache] | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, at.Float[at.Array, "b _t _d"]]:
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
         embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
-        assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
-
-        return [
+        normed = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if return_prelogits:
+            return normed, kv_cache, normed[0]  # expert 0 post-norm → prelogits
+        return normed, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
