@@ -29,8 +29,10 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    cotrain_subtask_data: bool = False  # π0.5 subtask text CE co-training
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    ce_loss_weight: float = 1.0  # α weight for subtask CE loss relative to FM loss
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -39,6 +41,8 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.cotrain_subtask_data and not self.pi05:
+            raise ValueError("cotrain_subtask_data requires pi05=True")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
