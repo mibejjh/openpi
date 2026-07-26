@@ -6,6 +6,7 @@ from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 import flax.traverse_util as traverse_util
 import jax
 import numpy as np
+import jax.numpy as jnp
 from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
@@ -264,6 +265,71 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+def _pad_to_len(arr: np.ndarray | jnp.ndarray, target_len: int, pad_val: int = 0) -> jnp.ndarray:
+    """Pad a 1D array to target_len by appending pad_val."""
+    arr = jnp.asarray(arr)
+    return jnp.pad(arr, (0, target_len - len(arr)), constant_values=pad_val)
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeSubtask(DataTransformFn):
+    """Tokenizes subtask prompt + target text for HL co-training.
+
+    Expects data dict with:
+      "prompt": str            — task context (e.g. "Task: clean the bedroom")
+      "subtask": str           — target text to predict (e.g. "pick up pillow")
+
+    Produces:
+      tokenized_prompt          — full [context + target] token sequence
+      tokenized_prompt_mask     — True for all tokens
+      token_ar_mask             — [0]*N_context + [1]*N_target (causal only on target)
+      token_loss_mask           — [0]*N_context + [1]*N_target (loss only on target)
+    """
+    tokenizer: _tokenizer.PaligemmaTokenizer
+    prompt_marker: str = ": Subtask:"  # marker between context and target
+
+    def __call__(self, data: DataDict) -> DataDict:
+        batch_size = len(data["prompt"])
+        all_prompt_tokens = []
+        all_ar_masks = []
+        all_loss_masks = []
+
+        for i in range(batch_size):
+            # Tokenize context + marker + target as one sequence
+            full_text = data["prompt"][i] + self.prompt_marker + data["subtask"][i]
+            full_tokens = self.tokenizer._tokenizer.encode(full_text, add_bos=True)
+
+            # Tokenize context + marker only to find split point
+            context_text = data["prompt"][i] + self.prompt_marker
+            context_tokens = self.tokenizer._tokenizer.encode(context_text, add_bos=True)
+            context_len = len(context_tokens)
+
+            ar_mask = jnp.zeros(len(full_tokens), dtype=jnp.int32)
+            ar_mask = ar_mask.at[context_len:].set(1)  # causal on target only
+
+            loss_mask = jnp.zeros(len(full_tokens), dtype=jnp.bool_)
+            loss_mask = loss_mask.at[context_len:].set(True)  # loss on target only
+
+            all_prompt_tokens.append(full_tokens)
+            all_ar_masks.append(ar_mask)
+            all_loss_masks.append(loss_mask)
+
+        # Pad to max_len
+        max_len = max(len(t) for t in all_prompt_tokens)
+        tokenized_prompt = jnp.stack([_pad_to_len(t, max_len) for t in all_prompt_tokens])
+        token_ar_mask = jnp.stack([_pad_to_len(m, max_len) for m in all_ar_masks])
+        token_loss_mask = jnp.stack([_pad_to_len(m, max_len, pad_val=False) for m in all_loss_masks])
+        tokenized_prompt_mask = jnp.ones_like(tokenized_prompt, dtype=jnp.bool_)
+
+        return {
+            **data,
+            "tokenized_prompt": tokenized_prompt,
+            "tokenized_prompt_mask": tokenized_prompt_mask,
+            "token_ar_mask": token_ar_mask,
+            "token_loss_mask": token_loss_mask,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
