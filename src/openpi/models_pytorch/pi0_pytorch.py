@@ -10,6 +10,11 @@ import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
+# TODO: Add cotrain_subtask_data / CE loss support for PyTorch parity.
+# Requires exposing return_prelogits in PaliGemmaWithExpertModel.forward() and
+# computing CE loss from backbone prelogits in PI0Pytorch.forward().
+# JAX path is the primary training path.
+
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
