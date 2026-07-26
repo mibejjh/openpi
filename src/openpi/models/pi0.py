@@ -67,6 +67,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.cotrain_subtask_data = config.cotrain_subtask_data
+        self.ce_loss_weight = config.ce_loss_weight
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -130,7 +132,11 @@ class Pi0(_model.BaseModel):
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
-            ar_mask += [False] * tokenized_inputs.shape[1]
+            if obs.token_ar_mask is not None:
+                # token_ar_mask: (*b, l) int tensor, 1=causal 0=bidir
+                ar_mask += [bool(v) for v in obs.token_ar_mask[0].tolist()]
+            else:
+                ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -198,7 +204,6 @@ class Pi0(_model.BaseModel):
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
@@ -206,12 +211,51 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
-        )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        # Forward pass — use return_prelogits when subtask co-training is enabled
+        if self.cotrain_subtask_data:
+            (prefix_out, suffix_out), _, prefix_prelogits = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens],
+                mask=attn_mask,
+                positions=positions,
+                adarms_cond=[None, adarms_cond],
+                return_prelogits=True,
+            )
+        else:
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens],
+                mask=attn_mask,
+                positions=positions,
+                adarms_cond=[None, adarms_cond],
+            )
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        fm_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (b, ah)
+
+        # Subtask text CE loss
+        if self.cotrain_subtask_data and observation.token_loss_mask is not None:
+            # Decode logits only for target positions (saves memory vs full vocab matmul)
+            target_len = observation.token_loss_mask.shape[-1]
+            target_prelogits = prefix_prelogits[:, -target_len:, :]
+            logits = self._decode_logits(target_prelogits)  # (b, target_len, vocab_size)
+            logp = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
+
+            # -log p(target_token) per position
+            targets = jax.nn.one_hot(
+                observation.tokenized_prompt[:, -target_len:], logits.shape[-1]
+            )
+            token_pplx = jnp.sum(targets * logp, axis=-1)  # (b, target_len)
+            ce_loss = -jnp.sum(token_pplx * observation.token_loss_mask, axis=-1)  # (b,)
+            ce_loss = ce_loss / jnp.clip(jnp.sum(observation.token_loss_mask, axis=-1), 1.0)
+
+            return fm_loss + self.ce_loss_weight * ce_loss[:, None]  # (b, ah)
+
+        return fm_loss
+
+    def _decode_logits(self, prelogits: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        """Decode prelogits to logits via the embedder's inverse projection."""
+        # ToNNX bridge: .embedder may or may not resolve; use .module.embedder as fallback
+        embedder = self.PaliGemma.llm.embedder if hasattr(self.PaliGemma.llm, "embedder") else self.PaliGemma.llm.module.embedder
+        return embedder.decode(prelogits)
 
     @override
     def sample_actions(
