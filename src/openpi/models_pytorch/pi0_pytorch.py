@@ -100,6 +100,7 @@ class PI0Pytorch(nn.Module):
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            stop_gradient_actions=getattr(config, "stop_gradient_actions", False),
         )
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
@@ -173,6 +174,8 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            getattr(observation, "token_loss_mask", None),
+            getattr(observation, "token_ar_mask", None),
         )
 
     def sample_noise(self, shape, device):
@@ -317,11 +320,11 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks, adarms_cond
-
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, token_loss_mask, token_ar_mask = (
+            self._preprocess_observation(observation, train=True)
+        )
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -351,9 +354,19 @@ class PI0Pytorch(nn.Module):
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
+        # Knowledge Insulation: enforce KI attention mask pattern
+        # Paper eq (5): P_ba = 0 (backbone → action blocked), P_ab (action → backbone allowed)
+        if getattr(self.config, "stop_gradient_actions", False):
+            prefix_len = prefix_embs.shape[1]
+            big_neg = -2.3819763e38
+            # Block backbone → action (P_ba = 0)
+            att_2d_masks_4d[:, :, :prefix_len, prefix_len:] = big_neg
+            # Allow action → backbone (P_ab) — unblock positions that cumsum mask blocked
+            att_2d_masks_4d[:, :, prefix_len:, :prefix_len] = 0.0
+
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -361,22 +374,58 @@ class PI0Pytorch(nn.Module):
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
+        # === Flow Matching Loss (continuous actions) ===
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        fm_loss = F.mse_loss(u_t, v_t, reduction="none")  # (b, ah)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        # === Joint FAST Training: CE loss on FAST tokenized actions ===
+        if getattr(self.config, "joint_fast_training", False) and token_loss_mask is not None:
+            # Compute CE loss on backbone output for FAST token positions
+            # prefix_out is the backbone's last hidden state for all prefix tokens (images + text)
+            # The language tokens are at the end of the prefix sequence
+            lang_tokens_len = lang_tokens.shape[1]
+            target_len = token_loss_mask.shape[-1]
+
+            # Get backbone prelogits for the target positions (end of prefix sequence)
+            target_prelogits = prefix_out[:, -target_len:, :]  # (b, target_len, d)
+            target_prelogits = target_prelogits.to(dtype=torch.float32)
+
+            # Apply lm_head to get logits over vocabulary
+            logits = self.paligemma_with_expert.paligemma.language_model.lm_head(
+                target_prelogits
+            )  # (b, target_len, vocab_size)
+
+            # Compute log-softmax
+            logp = F.log_softmax(logits, dim=-1)  # (b, target_len, vocab_size)
+
+            # One-hot targets: shifted by 1 (next-token prediction)
+            targets = F.one_hot(lang_tokens[:, -target_len:], logits.shape[-1]).to(dtype=logp.dtype)
+
+            # -log p(target_token) per position
+            token_pplx = torch.sum(targets * logp, dim=-1)  # (b, target_len)
+
+            # Apply loss mask
+            loss_mask = token_loss_mask.to(dtype=token_pplx.dtype)
+            ce_loss = -torch.sum(token_pplx * loss_mask, dim=-1)  # (b,)
+            ce_loss = ce_loss / torch.clamp(torch.sum(loss_mask, dim=-1), min=1.0)  # (b,)
+
+            # Return combined loss: FM loss + weighted CE loss
+            alpha = getattr(self.config, "fast_ce_loss_weight", 1.0)
+            return fm_loss + alpha * ce_loss[:, None]  # (b, ah)
+
+        return fm_loss
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -386,7 +435,7 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, *_ = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)

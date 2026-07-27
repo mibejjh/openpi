@@ -15,6 +15,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        stop_gradient_actions: bool = False,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -56,6 +57,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+        self.stop_gradient_actions = stop_gradient_actions
 
         self.to_bfloat16_for_selected_params(precision)
 
@@ -194,20 +196,77 @@ class PaliGemmaWithExpertModel(nn.Module):
                 )
 
                 batch_size = query_states.shape[0]
+                num_heads = query_states.shape[1]
+                head_dim = query_states.shape[3]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
-                # Get head_dim from the current layer, not from the model
-                head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
-                att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+                if self.stop_gradient_actions:
+                    # === Knowledge Insulation: block-wise attention with stop-gradient ===
+                    # Paper eq (5)-(6): gradients from action expert → backbone are blocked
+                    # in the attention computation.
+                    prefix_len = inputs_embeds[0].shape[1]
+
+                    # Split Q, K, V into backbone and action expert parts
+                    backbone_q = query_states[:, :, :prefix_len, :]
+                    action_q = query_states[:, :, prefix_len:, :]
+                    backbone_k = key_states[:, :, :prefix_len, :]
+                    action_k = key_states[:, :, prefix_len:, :]
+                    backbone_v = value_states[:, :, :prefix_len, :]
+                    action_v = value_states[:, :, prefix_len:, :]
+
+                    # P_bb = softmax(Q_b K_b^T + A_bb) — backbone-to-backbone (normal gradient)
+                    bb_logits = torch.matmul(backbone_q, backbone_k.transpose(-2, -1)) * scaling
+                    # P_ba = 0 — backbone→action blocked by attention mask (computed here for completeness)
+                    ba_logits = torch.matmul(backbone_q, action_k.transpose(-2, -1)) * scaling
+                    # P_ab = softmax(Q_a sg[K_b]^T + A_ab) — action→backbone (STOP GRADIENT on K_b)
+                    ab_logits = torch.matmul(action_q, backbone_k.detach().transpose(-2, -1)) * scaling
+                    # P_aa = softmax(Q_a K_a^T + A_aa) — action→action (normal gradient)
+                    aa_logits = torch.matmul(action_q, action_k.transpose(-2, -1)) * scaling
+
+                    # Combine into full logits matrix
+                    total_len = query_states.shape[2]
+                    full_logits = torch.zeros(
+                        batch_size, num_heads, total_len, total_len,
+                        device=query_states.device, dtype=query_states.dtype,
+                    )
+                    full_logits[:, :, :prefix_len, :prefix_len] = bb_logits
+                    full_logits[:, :, :prefix_len, prefix_len:] = ba_logits
+                    full_logits[:, :, prefix_len:, :prefix_len] = ab_logits
+                    full_logits[:, :, prefix_len:, prefix_len:] = aa_logits
+
+                    # Apply attention mask (P_ba positions are masked to -inf)
+                    full_logits = full_logits + attention_mask
+
+                    # Softmax
+                    probs = torch.softmax(full_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+                    # Attention dropout
+                    dropout_p = self.paligemma.language_model.layers[layer_idx].self_attn.attention_dropout
+                    if dropout_p > 0.0 and self.training:
+                        probs = torch.dropout(probs, p=dropout_p, train=self.training)
+
+                    # Value weighting: E_a = P_ab · sg[V_b] + P_aa · V_a  (stop grad on backbone V)
+                    backbone_out = torch.matmul(probs[:, :, :prefix_len, :], value_states)
+                    action_out = (
+                        torch.matmul(probs[:, :, prefix_len:, :prefix_len], backbone_v.detach())
+                        + torch.matmul(probs[:, :, prefix_len:, prefix_len:], action_v)
+                    )
+
+                    att_output = torch.cat([backbone_out, action_out], dim=2)  # [B, H, T, D]
+                    att_output = att_output.transpose(1, 2).contiguous()  # [B, T, H, D]
+                else:
+                    # Standard attention computation (original behavior)
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        self.paligemma.language_model.layers[layer_idx].self_attn,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        scaling,
+                    )
+
+                # Reshape [B, T, H, D] → [B, T, H * D] for expert output projection
+                att_output = att_output.reshape(batch_size, -1, num_heads * head_dim)
 
                 # Process layer outputs
                 outputs_embeds = []
